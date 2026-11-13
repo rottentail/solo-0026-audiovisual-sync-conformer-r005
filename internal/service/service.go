@@ -3,7 +3,7 @@ package service
 import (
 	"encoding/base64"
 	"fmt"
-	"math"
+	"sync"
 	"time"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
@@ -13,10 +13,34 @@ import (
 
 type Service struct {
 	repository *storage.Repository
+	locks      *keyLocks
 }
 
 func New(repository *storage.Repository) *Service {
-	return &Service{repository: repository}
+	return &Service{repository: repository, locks: newKeyLocks()}
+}
+
+// keyLocks serializes every request that reuses the same identifier so a
+// retry can never observe another request's in-progress record, and two
+// conflicting intents resolve in a stable, ordering-independent way.
+type keyLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newKeyLocks() *keyLocks {
+	return &keyLocks{locks: make(map[string]*sync.Mutex)}
+}
+
+func (k *keyLocks) forKey(key string) *sync.Mutex {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	lock := k.locks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		k.locks[key] = lock
+	}
+	return lock
 }
 
 func (s *Service) Repository() *storage.Repository {
@@ -80,21 +104,29 @@ func (s *Service) Analyze(takeID string, input domain.CreateAnalysisInput) (doma
 	if err := domain.ValidateCreateAnalysis(input); err != nil {
 		return domain.AnalysisResult{}, err
 	}
+	// Hold the identifier lock for the entire analysis so concurrent requests
+	// either replay the finished result of an identical request or receive a
+	// conflict; they can never observe or return an in-progress record.
+	lock := s.locks.forKey("analysis:" + input.AnalysisID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	take, err := s.repository.GetTake(takeID)
 	if err != nil {
 		return domain.AnalysisResult{}, err
 	}
 	now := time.Now().UTC()
+	// Persist the exact requested policy. Idempotency and conflict decisions
+	// compare this intent verbatim rather than a rounded storage bucket.
 	requestedPolicy := domain.SyncPolicy{
 		MinConfidence: input.MinConfidence,
 		MaxOffsetMS:   input.MaxOffsetMS,
 	}
-	storedPolicy := policyForStorage(requestedPolicy)
 	record := domain.SyncAnalysis{
 		ID:        input.AnalysisID,
 		TakeID:    take.ID,
 		State:     domain.AnalysisStateQueued,
-		Policy:    storedPolicy,
+		Policy:    requestedPolicy,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -128,25 +160,25 @@ func (s *Service) Analyze(takeID string, input domain.CreateAnalysisInput) (doma
 	record.VideoProminence = measurement.VideoProminence
 	record.UpdatedAt = time.Now().UTC()
 
-	if measurement.Confidence < storedPolicy.MinConfidence {
+	if measurement.Confidence < requestedPolicy.MinConfidence {
 		return s.failAnalysis(
 			record,
 			"low_confidence",
 			fmt.Sprintf(
 				"confidence %.3f is below the minimum %.3f",
 				measurement.Confidence,
-				storedPolicy.MinConfidence,
+				requestedPolicy.MinConfidence,
 			),
 		)
 	}
-	if abs(measurement.OffsetMS) > storedPolicy.MaxOffsetMS {
+	if abs(measurement.OffsetMS) > requestedPolicy.MaxOffsetMS {
 		return s.failAnalysis(
 			record,
 			"offset_exceeded",
 			fmt.Sprintf(
 				"offset %d ms exceeds the analysis limit of %d ms",
 				abs(measurement.OffsetMS),
-				storedPolicy.MaxOffsetMS,
+				requestedPolicy.MaxOffsetMS,
 			),
 		)
 	}
@@ -189,6 +221,13 @@ func (s *Service) CreateConform(
 	if err := domain.ValidateCreateConform(input); err != nil {
 		return domain.ConformResult{}, err
 	}
+	// Serialize the whole conform workflow on the conform identifier so an
+	// identical retry replays the completed job and a changed analysis or
+	// ceiling conflicts deterministically, regardless of request ordering.
+	lock := s.locks.forKey("conform:" + input.ConformID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	analysis, err := s.repository.GetAnalysis(analysisID)
 	if err != nil {
 		return domain.ConformResult{}, err
@@ -201,13 +240,14 @@ func (s *Service) CreateConform(
 			analysisID,
 		)
 	}
-	storedCorrectionLimit := correctionLimitForStorage(input.MaxCorrectionMS)
+	// Persist the exact requested ceiling; replay and conflict decisions
+	// compare it verbatim rather than a rounded bucket.
 	record := domain.ConformJob{
 		ID:               input.ConformID,
 		AnalysisID:       analysis.ID,
 		TakeID:           analysis.TakeID,
 		State:            domain.ConformStateQueued,
-		MaxCorrectionMS:  storedCorrectionLimit,
+		MaxCorrectionMS:  input.MaxCorrectionMS,
 		MeasuredOffsetMS: *analysis.OffsetMS,
 		CreatedAt:        time.Now().UTC(),
 		UpdatedAt:        time.Now().UTC(),
@@ -219,13 +259,13 @@ func (s *Service) CreateConform(
 	if !created {
 		return domain.ConformResult{Conform: existing, Created: false}, nil
 	}
-	if abs(record.MeasuredOffsetMS) > storedCorrectionLimit {
+	if abs(record.MeasuredOffsetMS) > input.MaxCorrectionMS {
 		record.State = domain.ConformStateFailed
 		record.ErrorCode = "correction_limit_exceeded"
 		record.ErrorMessage = fmt.Sprintf(
 			"measured correction of %d ms exceeds the ceiling of %d ms",
 			abs(record.MeasuredOffsetMS),
-			storedCorrectionLimit,
+			input.MaxCorrectionMS,
 		)
 		record.UpdatedAt = time.Now().UTC()
 		if err := s.repository.UpdateConform(record); err != nil {
@@ -355,23 +395,4 @@ func abs(value int) int {
 		return -value
 	}
 	return value
-}
-
-func policyForStorage(policy domain.SyncPolicy) domain.SyncPolicy {
-	normalized := domain.NormalizeSyncPolicy(policy)
-	normalized.MinConfidence = math.Round(normalized.MinConfidence*20) / 20
-	normalized.MaxOffsetMS = roundStorageLimit(normalized.MaxOffsetMS, 100)
-	return normalized
-}
-
-func correctionLimitForStorage(limitMS int) int {
-	normalized := domain.NormalizeCorrectionLimit(limitMS)
-	return roundStorageLimit(normalized, 50)
-}
-
-func roundStorageLimit(value, step int) int {
-	if value <= 0 || step <= 1 {
-		return value
-	}
-	return ((value + step/2) / step) * step
 }

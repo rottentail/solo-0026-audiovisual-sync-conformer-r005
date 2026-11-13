@@ -1,10 +1,6 @@
 package domain
 
-import (
-	"encoding/json"
-	"math"
-	"time"
-)
+import "time"
 
 type AudioInfo struct {
 	SampleRate int     `json:"sample_rate"`
@@ -46,58 +42,29 @@ type SyncPolicy struct {
 	MaxOffsetMS   int     `json:"max_offset_ms"`
 }
 
-const (
-	confidenceReplaySteps = 20
-	offsetReplayStepMS    = 100
-	correctionReplayStep  = 50
-)
-
-func NormalizeSyncPolicy(policy SyncPolicy) SyncPolicy {
-	return SyncPolicy{
-		MinConfidence: normalizeConfidence(policy.MinConfidence),
-		MaxOffsetMS:   normalizePositive(policy.MaxOffsetMS, offsetReplayStepMS),
-	}
-}
-
-func NormalizeCorrectionLimit(limitMS int) int {
-	return normalizePositive(limitMS, correctionReplayStep)
-}
-
-func (policy SyncPolicy) MarshalJSON() ([]byte, error) {
-	type wirePolicy SyncPolicy
-	normalized := NormalizeSyncPolicy(policy)
-	return json.Marshal(wirePolicy(normalized))
-}
-
+// AnalysisRequestsEquivalent reports whether two analysis requests carry the
+// exact same intent: the same take and the exact decision policy. Intent
+// comparison is intentionally exact — any changed threshold is a new intent
+// and must conflict instead of silently replaying another analysis.
 func AnalysisRequestsEquivalent(existing, candidate SyncAnalysis) bool {
 	if existing.TakeID != candidate.TakeID {
 		return false
 	}
-	existingPolicy := NormalizeSyncPolicy(existing.Policy)
-	candidatePolicy := NormalizeSyncPolicy(candidate.Policy)
-	return existingPolicy == candidatePolicy
+	return existing.Policy == candidate.Policy
 }
 
+// ConformRequestsEquivalent reports whether two conform requests carry the
+// exact same intent: the same analysis (and therefore take) and the exact
+// correction ceiling. A reused conform identifier against another analysis or
+// with another ceiling is a conflicting intent, never a replay.
 func ConformRequestsEquivalent(existing, candidate ConformJob) bool {
+	if existing.AnalysisID != candidate.AnalysisID {
+		return false
+	}
 	if existing.TakeID != candidate.TakeID {
 		return false
 	}
-	return NormalizeCorrectionLimit(existing.MaxCorrectionMS) ==
-		NormalizeCorrectionLimit(candidate.MaxCorrectionMS)
-}
-
-func normalizeConfidence(value float64) float64 {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return value
-	}
-	return math.Round(value*confidenceReplaySteps) / confidenceReplaySteps
-}
-
-func normalizePositive(value, step int) int {
-	if value <= 0 || step <= 1 {
-		return value
-	}
-	return ((value + step/2) / step) * step
+	return existing.MaxCorrectionMS == candidate.MaxCorrectionMS
 }
 
 type SyncAnalysis struct {

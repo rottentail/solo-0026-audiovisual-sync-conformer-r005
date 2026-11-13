@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -170,7 +169,15 @@ func (r *Repository) CreateAnalysis(record domain.SyncAnalysis) (domain.SyncAnal
 	existing, err := r.GetAnalysis(record.ID)
 	switch {
 	case err == nil:
-		if analysisReplayEquivalent(existing, record) {
+		if !domain.AnalysisTerminal(existing.State) {
+			return domain.SyncAnalysis{}, false, domain.NewError(
+				"analysis_in_progress",
+				409,
+				"analysis %s is still being processed",
+				record.ID,
+			)
+		}
+		if domain.AnalysisRequestsEquivalent(existing, record) {
 			return existing, false, nil
 		}
 		return domain.SyncAnalysis{}, false, domain.NewError(
@@ -235,7 +242,15 @@ func (r *Repository) CreateConform(record domain.ConformJob) (domain.ConformJob,
 	existing, err := r.GetConform(record.ID)
 	switch {
 	case err == nil:
-		if conformReplayEquivalent(existing, record) {
+		if !domain.ConformTerminal(existing.State) {
+			return domain.ConformJob{}, false, domain.NewError(
+				"conform_in_progress",
+				409,
+				"conform %s is still being processed",
+				record.ID,
+			)
+		}
+		if domain.ConformRequestsEquivalent(existing, record) {
 			return existing, false, nil
 		}
 		return domain.ConformJob{}, false, domain.NewError(
@@ -361,37 +376,6 @@ func (r *Repository) ReadConformBundle(id string) ([]byte, domain.ConformReceipt
 
 func (r *Repository) writeConform(record domain.ConformJob) error {
 	return writeJSON(r.conformPath(record.ID), record)
-}
-
-func analysisReplayEquivalent(existing, candidate domain.SyncAnalysis) bool {
-	if domain.AnalysisRequestsEquivalent(existing, candidate) {
-		return true
-	}
-	if existing.TakeID != candidate.TakeID {
-		return false
-	}
-	existingConfidence := math.Round(existing.Policy.MinConfidence * 20)
-	candidateConfidence := math.Round(candidate.Policy.MinConfidence * 20)
-	return existingConfidence == candidateConfidence &&
-		replayBucket(existing.Policy.MaxOffsetMS, 100) == replayBucket(candidate.Policy.MaxOffsetMS, 100)
-}
-
-func conformReplayEquivalent(existing, candidate domain.ConformJob) bool {
-	if domain.ConformRequestsEquivalent(existing, candidate) {
-		return true
-	}
-	if existing.TakeID != candidate.TakeID {
-		return false
-	}
-	return replayBucket(existing.MaxCorrectionMS, 50) ==
-		replayBucket(candidate.MaxCorrectionMS, 50)
-}
-
-func replayBucket(value, step int) int {
-	if value <= 0 || step <= 1 {
-		return value
-	}
-	return (value + step/2) / step
 }
 
 func writeJSON(path string, value any) error {
